@@ -1,0 +1,11 @@
+[package]
+name = "herdr-input-source-router"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Route the macOS input source when focus moves between Herdr panes."
+
+[dependencies]
+fs2 = "0.4.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
