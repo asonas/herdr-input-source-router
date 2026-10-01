@@ -1,35 +1,74 @@
-const ABC_INPUT_SOURCE: &str = "com.apple.keylayout.ABC";
-const AGENT_NAME: &str = "codex";
+const DEFAULT_INPUT_SOURCE: &str = "com.apple.keylayout.ABC";
 
-#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 struct State {
-    last_pane_id: Option<String>,
-    last_agent: Option<String>,
-    new_pane_ids: std::collections::BTreeSet<String>,
+    #[serde(default, alias = "last_pane_id")]
+    last_focused_pane_id: Option<String>,
+    #[serde(default)]
+    panes: std::collections::BTreeMap<String, PaneMemory>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct PaneMemory {
+    input_source_id: String,
+}
+
+fn event_data(payload: &serde_json::Value) -> &serde_json::Value {
+    payload.get("data").unwrap_or(payload)
 }
 
 fn pane_id_from(payload: &serde_json::Value) -> Option<&str> {
-    let event_data = payload.get("data").unwrap_or(payload);
-    event_data
+    crate::event_data(payload)
         .get("pane_id")
         .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            event_data
-                .get("pane")
-                .and_then(|pane| pane.get("pane_id"))
-                .and_then(serde_json::Value::as_str)
+}
+
+fn remember_focus(
+    state: &mut State,
+    focused_pane_id: &str,
+    observed_input_source: &str,
+) -> Option<String> {
+    let Some(previous_pane_id) = state.last_focused_pane_id.clone() else {
+        state.panes.insert(
+            focused_pane_id.to_owned(),
+            PaneMemory {
+                input_source_id: observed_input_source.to_owned(),
+            },
+        );
+        state.last_focused_pane_id = Some(focused_pane_id.to_owned());
+        return None;
+    };
+
+    if previous_pane_id == focused_pane_id {
+        state
+            .panes
+            .entry(focused_pane_id.to_owned())
+            .or_insert_with(|| PaneMemory {
+                input_source_id: observed_input_source.to_owned(),
+            });
+        return None;
+    }
+
+    state.panes.insert(
+        previous_pane_id,
+        PaneMemory {
+            input_source_id: observed_input_source.to_owned(),
+        },
+    );
+    let target = state
+        .panes
+        .entry(focused_pane_id.to_owned())
+        .or_insert_with(|| PaneMemory {
+            input_source_id: DEFAULT_INPUT_SOURCE.to_owned(),
         })
+        .input_source_id
+        .clone();
+    state.last_focused_pane_id = Some(focused_pane_id.to_owned());
+
+    (target != observed_input_source).then_some(target)
 }
 
-fn should_select_abc(
-    previous_agent: Option<&str>,
-    current_agent: Option<&str>,
-    is_new_pane: bool,
-) -> bool {
-    is_new_pane || (previous_agent == Some(AGENT_NAME) && current_agent.is_none())
-}
-
-fn current_pane() -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+fn current_pane_id() -> Result<Option<String>, Box<dyn std::error::Error>> {
     let herdr = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_owned());
     let output = std::process::Command::new(herdr)
         .args(["pane", "current"])
@@ -42,17 +81,31 @@ fn current_pane() -> Result<Option<serde_json::Value>, Box<dyn std::error::Error
     Ok(payload
         .get("result")
         .and_then(|result| result.get("pane"))
-        .cloned())
+        .and_then(|pane| pane.get("pane_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned))
 }
 
-fn select_abc() -> Result<(), Box<dyn std::error::Error>> {
-    let status = std::process::Command::new("macism")
-        .arg(ABC_INPUT_SOURCE)
-        .status()?;
-    if status.success() {
+fn current_input_source() -> Result<String, Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("macism").output()?;
+    if !output.status.success() {
+        return Err(format!("macism exited with {}", output.status).into());
+    }
+    let input_source = String::from_utf8(output.stdout)?.trim().to_owned();
+    if input_source.is_empty() {
+        return Err("macism returned an empty input source".into());
+    }
+    Ok(input_source)
+}
+
+fn select_input_source(input_source: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("macism")
+        .arg(input_source)
+        .output()?;
+    if output.status.success() {
         Ok(())
     } else {
-        Err(format!("macism exited with {status}").into())
+        Err(format!("macism exited with {}", output.status).into())
     }
 }
 
@@ -71,64 +124,51 @@ fn save_state(path: &std::path::Path, state: &State) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+fn handle_pane_focused(
+    event_pane_id: Option<&str>,
+    state: &mut State,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(focused_pane_id) = current_pane_id()? else {
+        return Ok(());
+    };
+    if event_pane_id.is_some_and(|pane_id| pane_id != focused_pane_id) {
+        return Ok(());
+    }
+
+    let observed_input_source = current_input_source()?;
+    if current_pane_id()?.as_deref() != Some(&focused_pane_id) {
+        return Ok(());
+    }
+    let mut next_state = state.clone();
+    let target = crate::remember_focus(&mut next_state, &focused_pane_id, &observed_input_source);
+    if current_pane_id()?.as_deref() != Some(&focused_pane_id) {
+        return Ok(());
+    }
+    if let Some(target) = target {
+        select_input_source(&target)?;
+    }
+    *state = next_state;
+    Ok(())
+}
+
 fn update_state(
     command: &str,
     payload: &serde_json::Value,
     state: &mut State,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let pane_id = pane_id_from(payload).map(str::to_owned);
-
     match command {
-        "pane-created" => {
-            if let Some(pane_id) = pane_id {
-                state.new_pane_ids.insert(pane_id);
-            }
-            return Ok(());
-        }
+        "pane-focused" => handle_pane_focused(crate::pane_id_from(payload), state),
         "pane-closed" => {
-            if let Some(pane_id) = pane_id {
-                state.new_pane_ids.remove(&pane_id);
-                if state.last_pane_id.as_deref() == Some(&pane_id) {
-                    state.last_pane_id = None;
-                    state.last_agent = None;
+            if let Some(pane_id) = crate::pane_id_from(payload) {
+                state.panes.remove(pane_id);
+                if state.last_focused_pane_id.as_deref() == Some(pane_id) {
+                    state.last_focused_pane_id = None;
                 }
             }
-            return Ok(());
+            Ok(())
         }
-        "pane-agent-detected" => {
-            if pane_id.as_deref() == state.last_pane_id.as_deref() {
-                state.last_agent = payload
-                    .get("data")
-                    .unwrap_or(payload)
-                    .get("agent")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
-            }
-            return Ok(());
-        }
-        "pane-focused" => {}
-        _ => return Err(format!("unknown command: {command}").into()),
+        _ => Err(format!("unknown command: {command}").into()),
     }
-
-    let Some(pane) = current_pane()? else {
-        return Ok(());
-    };
-    let Some(focused_pane_id) = pane.get("pane_id").and_then(serde_json::Value::as_str) else {
-        return Ok(());
-    };
-    if pane_id.as_deref().is_some_and(|id| id != focused_pane_id) {
-        return Ok(());
-    }
-    let current_agent = pane.get("agent").and_then(serde_json::Value::as_str);
-    let is_new_pane = state.new_pane_ids.contains(focused_pane_id);
-    if should_select_abc(state.last_agent.as_deref(), current_agent, is_new_pane) {
-        select_abc()?;
-    }
-
-    state.new_pane_ids.remove(focused_pane_id);
-    state.last_pane_id = Some(focused_pane_id.to_owned());
-    state.last_agent = current_agent.map(str::to_owned);
-    Ok(())
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -181,7 +221,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn reads_focused_pane_id_from_event_envelope() {
+    fn reads_pane_id_from_event_envelope() {
         let payload = serde_json::json!({
             "event": "pane.focused",
             "data": {"pane_id": "w1:p2"}
@@ -190,35 +230,83 @@ mod tests {
     }
 
     #[test]
-    fn reads_created_pane_id_from_event_envelope() {
+    fn first_focus_keeps_and_remembers_the_current_input_source() {
+        let mut state = crate::State::default();
+
+        let target = crate::remember_focus(&mut state, "w1:p1", "japanese");
+
+        assert_eq!(target, None);
+        assert_eq!(state.last_focused_pane_id.as_deref(), Some("w1:p1"));
+        assert_eq!(state.panes["w1:p1"].input_source_id, "japanese");
+    }
+
+    #[test]
+    fn new_pane_uses_abc_and_remembers_the_previous_pane() {
+        let mut state = crate::State::default();
+        crate::remember_focus(&mut state, "w1:p1", "japanese");
+
+        let target = crate::remember_focus(&mut state, "w1:p2", "japanese");
+
+        assert_eq!(target.as_deref(), Some(crate::DEFAULT_INPUT_SOURCE));
+        assert_eq!(state.panes["w1:p1"].input_source_id, "japanese");
+        assert_eq!(
+            state.panes["w1:p2"].input_source_id,
+            crate::DEFAULT_INPUT_SOURCE
+        );
+    }
+
+    #[test]
+    fn returning_to_a_pane_restores_its_input_source() {
+        let mut state = crate::State::default();
+        crate::remember_focus(&mut state, "w1:p1", "japanese");
+        crate::remember_focus(&mut state, "w1:p2", "japanese");
+
+        let target = crate::remember_focus(&mut state, "w1:p1", crate::DEFAULT_INPUT_SOURCE);
+
+        assert_eq!(target.as_deref(), Some("japanese"));
+        assert_eq!(
+            state.panes["w1:p2"].input_source_id,
+            crate::DEFAULT_INPUT_SOURCE
+        );
+    }
+
+    #[test]
+    fn repeated_focus_does_not_replace_existing_memory() {
+        let mut state = crate::State::default();
+        crate::remember_focus(&mut state, "w1:p1", "japanese");
+
+        let target = crate::remember_focus(&mut state, "w1:p1", "abc");
+
+        assert_eq!(target, None);
+        assert_eq!(state.panes["w1:p1"].input_source_id, "japanese");
+    }
+
+    #[test]
+    fn old_state_uses_last_pane_id_as_the_migration_baseline() {
+        let state: crate::State = serde_json::from_value(serde_json::json!({
+            "last_pane_id": "w1:p1",
+            "last_agent": "codex",
+            "new_pane_ids": []
+        }))
+        .expect("old state should deserialize");
+
+        assert_eq!(state.last_focused_pane_id.as_deref(), Some("w1:p1"));
+        assert!(state.panes.is_empty());
+    }
+
+    #[test]
+    fn closing_a_pane_removes_its_memory() {
+        let mut state = crate::State::default();
+        crate::remember_focus(&mut state, "w1:p1", "japanese");
         let payload = serde_json::json!({
-            "event": "pane.created",
-            "data": {"pane": {"pane_id": "w1:p3"}}
+            "event": "pane.closed",
+            "data": {"pane_id": "w1:p1"}
         });
-        assert_eq!(crate::pane_id_from(&payload), Some("w1:p3"));
-    }
 
-    #[test]
-    fn new_pane_selects_abc() {
-        assert!(crate::should_select_abc(Some("codex"), Some("codex"), true));
-    }
+        crate::update_state("pane-closed", &payload, &mut state)
+            .expect("pane close should succeed");
 
-    #[test]
-    fn codex_to_shell_selects_abc() {
-        assert!(crate::should_select_abc(Some("codex"), None, false));
-    }
-
-    #[test]
-    fn codex_to_codex_keeps_current_input_source() {
-        assert!(!crate::should_select_abc(
-            Some("codex"),
-            Some("codex"),
-            false
-        ));
-    }
-
-    #[test]
-    fn shell_to_codex_keeps_current_input_source() {
-        assert!(!crate::should_select_abc(None, Some("codex"), false));
+        assert!(state.panes.is_empty());
+        assert_eq!(state.last_focused_pane_id, None);
     }
 }

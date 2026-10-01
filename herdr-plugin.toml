@@ -1,6 +1,6 @@
 id = "asonas.input-source-router"
 name = "Input Source Router"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.4"
 description = "Route the macOS input source when focus moves between Herdr panes."
 platforms = ["macos"]
@@ -10,20 +10,12 @@ command = ["sh", "scripts/build.sh"]
 platforms = ["macos"]
 
 [[events]]
-on = "pane.created"
-command = ["bin/herdr-input-source-router", "pane-created"]
-
-[[events]]
 on = "pane.focused"
 command = ["bin/herdr-input-source-router", "pane-focused"]
 
 [[events]]
 on = "pane.closed"
 command = ["bin/herdr-input-source-router", "pane-closed"]
-
-[[events]]
-on = "pane.agent_detected"
-command = ["bin/herdr-input-source-router", "pane-agent-detected"]
 
 [[actions]]
 id = "status"
