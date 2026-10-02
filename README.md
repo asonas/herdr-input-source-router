@@ -1,5 +1,7 @@
 # Herdr Input Source Router
 
+[日本語](README.ja.md)
+
 A macOS plugin that changes the input source when focus moves between Herdr panes.
 
 The routing policy is intentionally small:
